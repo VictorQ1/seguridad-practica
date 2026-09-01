@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Panel protegido</title>
+
+    <style>
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: Arial, sans-serif;
+            background-color: #eef2f7;
+        }
+
+        .panel {
+            width: 100%;
+            max-width: 500px;
+            padding: 32px;
+            text-align: center;
+            background-color: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 18px rgba(0, 0, 0, 0.1);
+        }
+
+        .success {
+            padding: 12px;
+            color: #166534;
+            background-color: #dcfce7;
+            border-radius: 5px;
+        }
+
+        input[type="submit"] {
+            padding: 10px 18px;
+            border: none;
+            border-radius: 5px;
+            color: white;
+            background-color: #dc2626;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <main class="panel">
+        <h1>Panel protegido</h1>
+
+        <p class="success">
+            La primera capa de seguridad fue superada.
+        </p>
+
+        <p>
+            Usuario: <strong>{{ user["username"] }}</strong>
+        </p>
+
+        <p>
+            Correo: <strong>{{ user["email"] }}</strong>
+        </p>
+
+        <p>
+            Rol: <strong>{{ user["role"] }}</strong>
+        </p>
+
+        <form method="POST" action="{{ url_for('logout') }}">
+            {{ logout_form.hidden_tag() }}
+            {{ logout_form.submit() }}
+        </form>
+    </main>
+</body>
+
+</html>
