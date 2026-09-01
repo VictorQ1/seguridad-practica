@@ -1,5 +1,8 @@
 import os
+import random
+import secrets
 import sqlite3
+import time
 from datetime import timedelta
 
 import click
@@ -14,12 +17,12 @@ from flask import (
     url_for,
 )
 from flask_wtf import FlaskForm
-from wtforms import PasswordField, StringField, SubmitField
-from wtforms.validators import DataRequired, Length
+from wtforms import IntegerField, PasswordField, StringField, SubmitField
+from wtforms.validators import DataRequired, InputRequired, Length, NumberRange
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
-# Carga las variables almacenadas en .env
+# Carga las variables almacenadas en el .env
 load_dotenv()
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -56,10 +59,28 @@ class LoginForm(FlaskForm):
     submit = SubmitField("Iniciar sesión")
 
 
-# Formulario vacío utilizado para cerrar sesión de forma segura
+# Formulario vacío para cerrar sesión
 class LogoutForm(FlaskForm):
     submit = SubmitField("Cerrar sesión")
 
+class CaptchaForm(FlaskForm):
+    answer = IntegerField(
+        "Respuesta",
+        validators=[
+            InputRequired(message="Debes resolver la operación."),
+            NumberRange(
+                min=0,
+                max=100,
+                message="La respuesta debe ser un número válido.",
+            ),
+        ],
+    )
+
+    submit = SubmitField("Verificar CAPTCHA")
+
+
+class RefreshCaptchaForm(FlaskForm):
+    submit = SubmitField("Generar otra operación")
 
 def get_db():
     """Abre una conexión con SQLite para la petición actual."""
@@ -100,8 +121,67 @@ def init_db():
         """
     )
 
+    database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS captcha_challenges (
+            challenge_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            question TEXT NOT NULL,
+            answer INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+        """
+    )
+
     database.commit()
 
+def create_captcha(user_id):
+    """Crea una operación matemática con una vigencia de cinco minutos."""
+
+    database = get_db()
+
+    # Elimina operaciones anteriores del mismo usuario
+    database.execute(
+        """
+        DELETE FROM captcha_challenges
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+
+    first_number = random.randint(1, 10)
+    second_number = random.randint(1, 10)
+
+    question = f"{first_number} + {second_number}"
+    answer = first_number + second_number
+
+    challenge_id = secrets.token_urlsafe(32)
+    expires_at = int(time.time()) + 300
+
+    database.execute(
+        """
+        INSERT INTO captcha_challenges (
+            challenge_id,
+            user_id,
+            question,
+            answer,
+            expires_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            challenge_id,
+            user_id,
+            question,
+            answer,
+            expires_at,
+        ),
+    )
+
+    database.commit()
+
+    session["captcha_id"] = challenge_id
 
 @app.cli.command("create-user")
 @click.argument("username")
@@ -148,7 +228,10 @@ def create_user(username, email, password):
 @app.route("/", methods=["GET", "POST"])
 def login():
     if session.get("user_id"):
-        return redirect(url_for("dashboard"))
+        if session.get("security_layer", 0) >= 2:
+            return redirect(url_for("dashboard"))
+
+        return redirect(url_for("captcha"))
 
     form = LoginForm()
 
@@ -174,12 +257,106 @@ def login():
             session["username"] = user["username"]
             session["security_layer"] = 1
 
-            return redirect(url_for("dashboard"))
+            create_captcha(user["id"])
+
+            return redirect(url_for("captcha"))
 
         flash("Usuario o contraseña incorrectos.", "error")
 
     return render_template("login.html", form=form)
 
+@app.route("/captcha", methods=["GET", "POST"])
+def captcha():
+    user_id = session.get("user_id")
+    security_layer = session.get("security_layer", 0)
+
+    if not user_id:
+        flash("Primero debes iniciar sesión.", "error")
+        return redirect(url_for("login"))
+
+    if security_layer >= 2:
+        return redirect(url_for("dashboard"))
+
+    if security_layer != 1:
+        session.clear()
+        return redirect(url_for("login"))
+
+    database = get_db()
+    challenge_id = session.get("captcha_id")
+
+    challenge = database.execute(
+        """
+        SELECT challenge_id, user_id, question, answer, expires_at
+        FROM captcha_challenges
+        WHERE challenge_id = ? AND user_id = ?
+        """,
+        (challenge_id, user_id),
+    ).fetchone()
+
+    if challenge is None:
+        create_captcha(user_id)
+        return redirect(url_for("captcha"))
+
+    if challenge["expires_at"] < int(time.time()):
+        create_captcha(user_id)
+        flash(
+            "El CAPTCHA expiró. Se generó una nueva operación.",
+            "error",
+        )
+        return redirect(url_for("captcha"))
+
+    captcha_form = CaptchaForm()
+    refresh_form = RefreshCaptchaForm()
+
+    if captcha_form.validate_on_submit():
+        if captcha_form.answer.data == challenge["answer"]:
+            database.execute(
+                """
+                DELETE FROM captcha_challenges
+                WHERE challenge_id = ?
+                """,
+                (challenge["challenge_id"],),
+            )
+
+            database.commit()
+
+            session.pop("captcha_id", None)
+            session["security_layer"] = 2
+
+            flash("CAPTCHA resuelto correctamente.", "success")
+            return redirect(url_for("dashboard"))
+
+        create_captcha(user_id)
+
+        flash(
+            "La respuesta es incorrecta. Se generó otra operación.",
+            "error",
+        )
+
+        return redirect(url_for("captcha"))
+
+    return render_template(
+        "captcha.html",
+        question=challenge["question"],
+        captcha_form=captcha_form,
+        refresh_form=refresh_form,
+    )
+
+@app.route("/captcha/refresh", methods=["POST"])
+def refresh_captcha():
+    user_id = session.get("user_id")
+    security_layer = session.get("security_layer", 0)
+
+    if not user_id or security_layer != 1:
+        return redirect(url_for("login"))
+
+    form = RefreshCaptchaForm()
+
+    if form.validate_on_submit():
+        create_captcha(user_id)
+        flash("Se generó una nueva operación.", "success")
+
+    return redirect(url_for("captcha"))
 
 @app.route("/dashboard")
 def dashboard():
@@ -189,6 +366,9 @@ def dashboard():
         flash("Debes iniciar sesión para acceder.", "error")
         return redirect(url_for("login"))
 
+    if session.get("security_layer", 0) < 2:
+        flash("Debes completar el CAPTCHA.", "error")
+        return redirect(url_for("captcha"))
     database = get_db()
 
     user = database.execute(
@@ -218,6 +398,21 @@ def logout():
     form = LogoutForm()
 
     if form.validate_on_submit():
+        challenge_id = session.get("captcha_id")
+
+        if challenge_id:
+            database = get_db()
+
+            database.execute(
+                """
+                DELETE FROM captcha_challenges
+                WHERE challenge_id = ?
+                """,
+                (challenge_id,),
+            )
+
+            database.commit()
+
         session.clear()
         flash("La sesión se cerró correctamente.", "success")
 
