@@ -3,6 +3,12 @@ import random
 import secrets
 import sqlite3
 import time
+import hashlib
+import hmac
+import smtplib
+import ssl
+from email.message import EmailMessage
+from email.headerregistry import Address
 from datetime import timedelta
 
 import click
@@ -18,7 +24,13 @@ from flask import (
 )
 from flask_wtf import FlaskForm
 from wtforms import IntegerField, PasswordField, StringField, SubmitField
-from wtforms.validators import DataRequired, InputRequired, Length, NumberRange
+from wtforms.validators import (
+    DataRequired,
+    InputRequired,
+    Length,
+    NumberRange,
+    Regexp,
+)
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -82,6 +94,24 @@ class CaptchaForm(FlaskForm):
 class RefreshCaptchaForm(FlaskForm):
     submit = SubmitField("Generar otra operación")
 
+class EmailCodeForm(FlaskForm):
+    code = StringField(
+        "Código de verificación",
+        validators=[
+            DataRequired(message="Ingresa el código recibido."),
+            Regexp(
+                r"^\d{6}$",
+                message="El código debe contener exactamente seis números.",
+            ),
+        ],
+    )
+
+    submit = SubmitField("Verificar código")
+
+
+class ResendEmailCodeForm(FlaskForm):
+    submit = SubmitField("Enviar otro código")
+
 def get_db():
     """Abre una conexión con SQLite para la petición actual."""
 
@@ -129,6 +159,20 @@ def init_db():
             question TEXT NOT NULL,
             answer INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+        """
+    )
+
+    database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS email_challenges (
+            challenge_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            code_hash TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
         """
@@ -183,6 +227,156 @@ def create_captcha(user_id):
 
     session["captcha_id"] = challenge_id
 
+def hash_email_code(code):
+    """Crea un HMAC del código utilizando la clave secreta."""
+
+    secret_key = app.config["SECRET_KEY"].encode("utf-8")
+    code_bytes = code.encode("utf-8")
+
+    return hmac.new(
+        secret_key,
+        code_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def send_verification_email(recipient, code):
+    """Envía el código mediante SMTP."""
+
+    mail_server = os.getenv("MAIL_SERVER")
+    mail_port = int(os.getenv("MAIL_PORT", "587"))
+    mail_use_tls = os.getenv("MAIL_USE_TLS", "true").lower() == "true"
+    mail_username = os.getenv("MAIL_USERNAME")
+    mail_password = os.getenv("MAIL_PASSWORD")
+    mail_from = os.getenv("MAIL_FROM", mail_username)
+    mail_sender_name = os.getenv(
+    "MAIL_SENDER_NAME",
+    "Sistema de Seguridad",
+)
+    if not all(
+        [
+            mail_server,
+            mail_username,
+            mail_password,
+            mail_from,
+        ]
+    ):
+        raise RuntimeError(
+            "La configuración SMTP está incompleta en el archivo .env"
+        )
+
+    message = EmailMessage()
+    message["Subject"] = "Código de verificación"
+    message["From"] = Address(
+    display_name=mail_sender_name,
+    addr_spec=mail_from,
+)
+    message["To"] = recipient
+
+    message.set_content(
+        f"""
+Se solicitó un código para acceder al sistema de seguridad.
+
+Tu código de verificación es:
+
+{code}
+
+El código expirará en cinco minutos.
+
+Si no realizaste esta solicitud, puedes ignorar este mensaje.
+""".strip()
+    )
+
+    ssl_context = ssl.create_default_context()
+
+    with smtplib.SMTP(
+        mail_server,
+        mail_port,
+        timeout=15,
+    ) as smtp:
+        smtp.ehlo()
+
+        if mail_use_tls:
+            smtp.starttls(context=ssl_context)
+            smtp.ehlo()
+
+        smtp.login(mail_username, mail_password)
+        smtp.send_message(message)
+
+
+def create_email_challenge(user_id):
+    """Genera, envía y almacena un desafío de correo."""
+
+    database = get_db()
+
+    user = database.execute(
+        """
+        SELECT id, email
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if user is None:
+        raise RuntimeError("El usuario no existe")
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    challenge_id = secrets.token_urlsafe(32)
+    current_time = int(time.time())
+    expires_at = current_time + 300
+
+    # Primero intenta enviar el código. Si el envío falla,
+    # el código anterior permanece disponible.
+    send_verification_email(user["email"], code)
+
+    database.execute(
+        """
+        DELETE FROM email_challenges
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+
+    database.execute(
+        """
+        INSERT INTO email_challenges (
+            challenge_id,
+            user_id,
+            code_hash,
+            expires_at,
+            attempts,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, 0, ?)
+        """,
+        (
+            challenge_id,
+            user_id,
+            hash_email_code(code),
+            expires_at,
+            current_time,
+        ),
+    )
+
+    database.commit()
+
+    session["email_challenge_id"] = challenge_id
+
+
+def mask_email(email):
+    """Oculta parcialmente el correo mostrado en pantalla."""
+
+    local_part, separator, domain = email.partition("@")
+
+    if not separator:
+        return email
+
+    visible_character = local_part[:1]
+    hidden_characters = "*" * max(len(local_part) - 1, 3)
+
+    return f"{visible_character}{hidden_characters}@{domain}"
+
 @app.cli.command("create-user")
 @click.argument("username")
 @click.option("--email", prompt="Correo electrónico")
@@ -228,8 +422,13 @@ def create_user(username, email, password):
 @app.route("/", methods=["GET", "POST"])
 def login():
     if session.get("user_id"):
-        if session.get("security_layer", 0) >= 2:
+        security_layer = session.get("security_layer", 0)
+
+        if security_layer >= 3:
             return redirect(url_for("dashboard"))
+
+        if security_layer == 2:
+            return redirect(url_for("email_verification"))
 
         return redirect(url_for("captcha"))
 
@@ -274,8 +473,11 @@ def captcha():
         flash("Primero debes iniciar sesión.", "error")
         return redirect(url_for("login"))
 
-    if security_layer >= 2:
+    if security_layer >= 3:
         return redirect(url_for("dashboard"))
+
+    if security_layer == 2:
+        return redirect(url_for("email_verification"))
 
     if security_layer != 1:
         session.clear()
@@ -323,8 +525,26 @@ def captcha():
             session.pop("captcha_id", None)
             session["security_layer"] = 2
 
-            flash("CAPTCHA resuelto correctamente.", "success")
-            return redirect(url_for("dashboard"))
+            try:
+                create_email_challenge(user_id)
+
+                flash(
+                    "Se envió un código de verificación a tu correo.",
+                    "success",
+                )
+
+            except Exception:
+                app.logger.exception(
+                    "No fue posible enviar el código por correo"
+                )
+
+                flash(
+                    "No fue posible enviar el código. "
+                    "Revisa la configuración SMTP e intenta nuevamente.",
+                    "error",
+                )
+
+            return redirect(url_for("email_verification"))
 
         create_captcha(user_id)
 
@@ -358,6 +578,220 @@ def refresh_captcha():
 
     return redirect(url_for("captcha"))
 
+@app.route("/email-verification", methods=["GET", "POST"])
+def email_verification():
+    user_id = session.get("user_id")
+    security_layer = session.get("security_layer", 0)
+
+    if not user_id:
+        flash("Primero debes iniciar sesión.", "error")
+        return redirect(url_for("login"))
+
+    if security_layer >= 3:
+        return redirect(url_for("dashboard"))
+
+    if security_layer < 2:
+        return redirect(url_for("captcha"))
+
+    database = get_db()
+
+    user = database.execute(
+        """
+        SELECT id, email
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if user is None:
+        session.clear()
+        return redirect(url_for("login"))
+
+    challenge_id = session.get("email_challenge_id")
+
+    challenge = database.execute(
+        """
+        SELECT
+            challenge_id,
+            user_id,
+            code_hash,
+            expires_at,
+            attempts,
+            created_at
+        FROM email_challenges
+        WHERE challenge_id = ? AND user_id = ?
+        """,
+        (challenge_id, user_id),
+    ).fetchone()
+
+    if challenge and challenge["expires_at"] < int(time.time()):
+        database.execute(
+            """
+            DELETE FROM email_challenges
+            WHERE challenge_id = ?
+            """,
+            (challenge["challenge_id"],),
+        )
+
+        database.commit()
+
+        session.pop("email_challenge_id", None)
+        challenge = None
+
+        flash(
+            "El código expiró. Solicita uno nuevo.",
+            "error",
+        )
+
+    code_form = EmailCodeForm()
+    resend_form = ResendEmailCodeForm()
+
+    if code_form.validate_on_submit():
+        if challenge is None:
+            flash(
+                "No hay un código activo. Solicita uno nuevo.",
+                "error",
+            )
+            return redirect(url_for("email_verification"))
+
+        received_hash = hash_email_code(code_form.code.data)
+
+        if hmac.compare_digest(
+            received_hash,
+            challenge["code_hash"],
+        ):
+            database.execute(
+                """
+                DELETE FROM email_challenges
+                WHERE challenge_id = ?
+                """,
+                (challenge["challenge_id"],),
+            )
+
+            database.commit()
+
+            session.pop("email_challenge_id", None)
+            session["security_layer"] = 3
+
+            flash(
+                "Código de correo verificado correctamente.",
+                "success",
+            )
+
+            return redirect(url_for("dashboard"))
+
+        new_attempt_count = challenge["attempts"] + 1
+
+        if new_attempt_count >= 5:
+            database.execute(
+                """
+                DELETE FROM email_challenges
+                WHERE challenge_id = ?
+                """,
+                (challenge["challenge_id"],),
+            )
+
+            database.commit()
+            session.pop("email_challenge_id", None)
+
+            flash(
+                "Se alcanzó el máximo de intentos. "
+                "Solicita un código nuevo.",
+                "error",
+            )
+
+        else:
+            database.execute(
+                """
+                UPDATE email_challenges
+                SET attempts = ?
+                WHERE challenge_id = ?
+                """,
+                (
+                    new_attempt_count,
+                    challenge["challenge_id"],
+                ),
+            )
+
+            database.commit()
+
+            remaining_attempts = 5 - new_attempt_count
+
+            flash(
+                f"Código incorrecto. "
+                f"Intentos restantes: {remaining_attempts}.",
+                "error",
+            )
+
+        return redirect(url_for("email_verification"))
+
+    return render_template(
+        "email_verification.html",
+        masked_email=mask_email(user["email"]),
+        has_active_code=challenge is not None,
+        code_form=code_form,
+        resend_form=resend_form,
+    )
+
+@app.route("/email-verification/resend", methods=["POST"])
+def resend_email_code():
+    user_id = session.get("user_id")
+    security_layer = session.get("security_layer", 0)
+
+    if not user_id or security_layer != 2:
+        return redirect(url_for("login"))
+
+    form = ResendEmailCodeForm()
+
+    if not form.validate_on_submit():
+        return redirect(url_for("email_verification"))
+
+    database = get_db()
+
+    current_challenge = database.execute(
+        """
+        SELECT created_at
+        FROM email_challenges
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if current_challenge:
+        elapsed_time = int(time.time()) - current_challenge["created_at"]
+
+        if elapsed_time < 60:
+            remaining_time = 60 - elapsed_time
+
+            flash(
+                f"Espera {remaining_time} segundos antes de solicitar otro código.",
+                "error",
+            )
+
+            return redirect(url_for("email_verification"))
+
+    try:
+        create_email_challenge(user_id)
+
+        flash(
+            "Se envió un nuevo código a tu correo.",
+            "success",
+        )
+
+    except Exception:
+        app.logger.exception(
+            "No fue posible reenviar el código"
+        )
+
+        flash(
+            "No fue posible enviar el código. "
+            "Revisa la configuración SMTP.",
+            "error",
+        )
+
+    return redirect(url_for("email_verification"))
+
 @app.route("/dashboard")
 def dashboard():
     user_id = session.get("user_id")
@@ -366,9 +800,15 @@ def dashboard():
         flash("Debes iniciar sesión para acceder.", "error")
         return redirect(url_for("login"))
 
-    if session.get("security_layer", 0) < 2:
+    security_layer = session.get("security_layer", 0)
+
+    if security_layer < 2:
         flash("Debes completar el CAPTCHA.", "error")
         return redirect(url_for("captcha"))
+
+    if security_layer < 3:
+        flash("Debes verificar el código enviado por correo.", "error")
+        return redirect(url_for("email_verification"))
     database = get_db()
 
     user = database.execute(
@@ -399,7 +839,7 @@ def logout():
 
     if form.validate_on_submit():
         challenge_id = session.get("captcha_id")
-
+        email_challenge_id = session.get("email_challenge_id")
         if challenge_id:
             database = get_db()
 
@@ -409,6 +849,17 @@ def logout():
                 WHERE challenge_id = ?
                 """,
                 (challenge_id,),
+            )
+
+        if email_challenge_id:
+            database = get_db()
+
+            database.execute(
+                """
+                DELETE FROM email_challenges
+                WHERE challenge_id = ?
+                """,
+                (email_challenge_id,),
             )
 
             database.commit()
