@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Verificación con autenticador</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            font-family: Arial, sans-serif;
+            background-color: #eef2f7;
+        }
+
+        .verification-container {
+            width: 100%;
+            max-width: 470px;
+            padding: 32px;
+            text-align: center;
+            background-color: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 18px rgba(0, 0, 0, 0.1);
+        }
+
+        h1 {
+            margin-top: 0;
+            color: #1f2937;
+        }
+
+        .description {
+            color: #6b7280;
+        }
+
+        .qr-image {
+            display: block;
+            width: 230px;
+            height: 230px;
+            margin: 20px auto;
+        }
+
+        .secret-container {
+            padding: 12px;
+            margin: 16px 0 24px;
+            overflow-wrap: anywhere;
+            background-color: #f1f5f9;
+            border-radius: 5px;
+        }
+
+        code {
+            font-size: 15px;
+            color: #1e3a8a;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            text-align: left;
+            font-weight: bold;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 16px;
+            border: 1px solid #cbd5e1;
+            border-radius: 5px;
+            text-align: center;
+            font-size: 22px;
+            letter-spacing: 6px;
+        }
+
+        input[type="submit"] {
+            width: 100%;
+            padding: 11px;
+            border: none;
+            border-radius: 5px;
+            color: white;
+            background-color: #2563eb;
+            cursor: pointer;
+        }
+
+        input[type="submit"]:hover {
+            background-color: #1d4ed8;
+        }
+
+        .message {
+            padding: 10px;
+            margin-bottom: 16px;
+            border-radius: 5px;
+        }
+
+        .error {
+            color: #991b1b;
+            background-color: #fee2e2;
+        }
+
+        .success {
+            color: #166534;
+            background-color: #dcfce7;
+        }
+
+        .field-error {
+            color: #b91c1c;
+            font-size: 14px;
+        }
+
+        .warning {
+            color: #92400e;
+            font-size: 14px;
+        }
+    </style>
+</head>
+
+<body>
+    <main class="verification-container">
+        {% if setup_mode %}
+        <h1>Configurar autenticador</h1>
+
+        <p class="description">
+            Capa 4 de seguridad
+        </p>
+
+        <p>
+            Escanea este código con Google Authenticator,
+            Microsoft Authenticator u Oracle Authenticator.
+        </p>
+
+        <img class="qr-image" src="data:image/png;base64,{{ qr_image }}"
+            alt="Código QR para configurar el autenticador">
+
+        <p>
+            Si no puedes escanearlo, introduce esta clave manualmente:
+        </p>
+
+        <div class="secret-container">
+            <code>{{ totp_secret }}</code>
+        </div>
+
+        <p class="warning">
+            No compartas el QR ni la clave secreta.
+        </p>
+        {% else %}
+        <h1>Código del autenticador</h1>
+
+        <p class="description">
+            Capa 4 de seguridad
+        </p>
+
+        <p>
+            Introduce el código de seis dígitos generado
+            por tu aplicación.
+        </p>
+        {% endif %}
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+        <div class="message {{ category }}">
+            {{ message }}
+        </div>
+        {% endfor %}
+        {% endwith %}
+
+        <form method="POST">
+            {{ form.hidden_tag() }}
+
+            {{ form.code.label }}
+
+            {{ form.code(
+            maxlength="6",
+            minlength="6",
+            inputmode="numeric",
+            pattern="[0-9]{6}",
+            autocomplete="one-time-code",
+            autofocus=true
+            ) }}
+
+            {% for error in form.code.errors %}
+            <p class="field-error">{{ error }}</p>
+            {% endfor %}
+
+            {{ form.submit() }}
+        </form>
+    </main>
+</body>
+
+</html>

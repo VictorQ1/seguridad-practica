@@ -7,9 +7,13 @@ import hashlib
 import hmac
 import smtplib
 import ssl
+import base64
+import io
+import pyotp
+import qrcode
 from email.message import EmailMessage
 from email.headerregistry import Address
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import click
 from dotenv import load_dotenv
@@ -17,6 +21,7 @@ from flask import (
     Flask,
     flash,
     g,
+    make_response,
     redirect,
     render_template,
     session,
@@ -112,6 +117,20 @@ class EmailCodeForm(FlaskForm):
 class ResendEmailCodeForm(FlaskForm):
     submit = SubmitField("Enviar otro código")
 
+class TotpCodeForm(FlaskForm):
+    code = StringField(
+        "Código del autenticador",
+        validators=[
+            DataRequired(message="Ingresa el código del autenticador."),
+            Regexp(
+                r"^\d{6}$",
+                message="El código debe contener exactamente seis números.",
+            ),
+        ],
+    )
+
+    submit = SubmitField("Verificar código")
+
 def get_db():
     """Abre una conexión con SQLite para la petición actual."""
 
@@ -173,6 +192,16 @@ def init_db():
             expires_at INTEGER NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+        """
+    )
+
+    database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS totp_usage (
+            user_id INTEGER PRIMARY KEY,
+            last_timecode INTEGER NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
         """
@@ -377,6 +406,52 @@ def mask_email(email):
 
     return f"{visible_character}{hidden_characters}@{domain}"
 
+def find_totp_timecode(secret, code):
+    """
+    Verifica el código actual y permite una diferencia
+    máxima de 30 segundos.
+    """
+
+    code = code.strip()
+
+    if not code.isdigit() or len(code) != 6:
+        return None
+
+    totp = pyotp.TOTP(secret)
+    current_time = datetime.now(timezone.utc)
+
+    for offset in (0, -1, 1):
+        candidate_time = current_time + timedelta(
+            seconds=offset * totp.interval
+        )
+
+        expected_code = totp.at(candidate_time)
+
+        if hmac.compare_digest(expected_code, code):
+            return totp.timecode(candidate_time)
+
+    return None
+
+
+def create_totp_qr(secret, account_name):
+    """Genera un QR TOTP y lo devuelve codificado en Base64."""
+
+    totp = pyotp.TOTP(secret)
+
+    provisioning_uri = totp.provisioning_uri(
+        name=account_name,
+        issuer_name="Seguridad Práctica",
+    )
+
+    qr_image = qrcode.make(provisioning_uri)
+    image_buffer = io.BytesIO()
+
+    qr_image.save(image_buffer, format="PNG")
+
+    return base64.b64encode(
+        image_buffer.getvalue()
+    ).decode("ascii")
+
 @app.cli.command("create-user")
 @click.argument("username")
 @click.option("--email", prompt="Correo electrónico")
@@ -424,8 +499,11 @@ def login():
     if session.get("user_id"):
         security_layer = session.get("security_layer", 0)
 
-        if security_layer >= 3:
+        if security_layer >= 4:
             return redirect(url_for("dashboard"))
+
+        if security_layer == 3:
+            return redirect(url_for("totp_verification"))
 
         if security_layer == 2:
             return redirect(url_for("email_verification"))
@@ -473,8 +551,11 @@ def captcha():
         flash("Primero debes iniciar sesión.", "error")
         return redirect(url_for("login"))
 
-    if security_layer >= 3:
+    if security_layer >= 4:
         return redirect(url_for("dashboard"))
+
+    if security_layer == 3:
+        return redirect(url_for("totp_verification"))
 
     if security_layer == 2:
         return redirect(url_for("email_verification"))
@@ -587,8 +668,11 @@ def email_verification():
         flash("Primero debes iniciar sesión.", "error")
         return redirect(url_for("login"))
 
-    if security_layer >= 3:
+    if security_layer >= 4:
         return redirect(url_for("dashboard"))
+
+    if security_layer == 3:
+        return redirect(url_for("totp_verification"))
 
     if security_layer < 2:
         return redirect(url_for("captcha"))
@@ -679,7 +763,7 @@ def email_verification():
                 "success",
             )
 
-            return redirect(url_for("dashboard"))
+            return redirect(url_for("totp_verification"))
 
         new_attempt_count = challenge["attempts"] + 1
 
@@ -792,6 +876,179 @@ def resend_email_code():
 
     return redirect(url_for("email_verification"))
 
+@app.route("/totp-verification", methods=["GET", "POST"])
+def totp_verification():
+    user_id = session.get("user_id")
+    security_layer = session.get("security_layer", 0)
+
+    if not user_id:
+        flash("Primero debes iniciar sesión.", "error")
+        return redirect(url_for("login"))
+
+    if security_layer >= 4:
+        return redirect(url_for("dashboard"))
+
+    if security_layer < 2:
+        return redirect(url_for("captcha"))
+
+    if security_layer < 3:
+        return redirect(url_for("email_verification"))
+
+    database = get_db()
+
+    user = database.execute(
+        """
+        SELECT
+            id,
+            username,
+            email,
+            totp_secret,
+            totp_enabled
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if user is None:
+        session.clear()
+        return redirect(url_for("login"))
+
+    totp_secret = user["totp_secret"]
+
+    # Primera configuración del autenticador
+    if not totp_secret:
+        totp_secret = pyotp.random_base32()
+
+        database.execute(
+            """
+            UPDATE users
+            SET totp_secret = ?, totp_enabled = 0
+            WHERE id = ?
+            """,
+            (totp_secret, user_id),
+        )
+
+        database.commit()
+
+    setup_mode = not bool(user["totp_enabled"])
+    form = TotpCodeForm()
+
+    if form.validate_on_submit():
+        matched_timecode = find_totp_timecode(
+            totp_secret,
+            form.code.data,
+        )
+
+        if matched_timecode is None:
+            attempts = session.get("totp_attempts", 0) + 1
+            session["totp_attempts"] = attempts
+
+            if attempts >= 5:
+                session.clear()
+
+                flash(
+                    "Se alcanzó el máximo de intentos. "
+                    "Inicia el proceso nuevamente.",
+                    "error",
+                )
+
+                return redirect(url_for("login"))
+
+            remaining_attempts = 5 - attempts
+
+            flash(
+                f"Código incorrecto. "
+                f"Intentos restantes: {remaining_attempts}.",
+                "error",
+            )
+
+            return redirect(url_for("totp_verification"))
+
+        previous_usage = database.execute(
+            """
+            SELECT last_timecode
+            FROM totp_usage
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+
+        if (
+            previous_usage
+            and matched_timecode <= previous_usage["last_timecode"]
+        ):
+            flash(
+                "Este código ya fue utilizado. "
+                "Espera a que la aplicación genere uno nuevo.",
+                "error",
+            )
+
+            return redirect(url_for("totp_verification"))
+
+        database.execute(
+            """
+            UPDATE users
+            SET totp_enabled = 1
+            WHERE id = ?
+            """,
+            (user_id,),
+        )
+
+        database.execute(
+            """
+            INSERT INTO totp_usage (user_id, last_timecode)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET last_timecode = excluded.last_timecode
+            """,
+            (user_id, matched_timecode),
+        )
+
+        database.commit()
+
+        session.pop("totp_attempts", None)
+        session["security_layer"] = 4
+
+        if setup_mode:
+            flash(
+                "El autenticador fue configurado correctamente.",
+                "success",
+            )
+        else:
+            flash(
+                "Código del autenticador verificado.",
+                "success",
+            )
+
+        return redirect(url_for("dashboard"))
+
+    qr_image = None
+
+    if setup_mode:
+        qr_image = create_totp_qr(
+            totp_secret,
+            user["email"],
+        )
+
+    response = make_response(
+        render_template(
+            "totp_verification.html",
+            form=form,
+            setup_mode=setup_mode,
+            qr_image=qr_image,
+            totp_secret=totp_secret if setup_mode else None,
+        )
+    )
+
+    # Evita guardar en caché una página que contiene el secreto TOTP
+    response.headers["Cache-Control"] = (
+        "no-store, no-cache, must-revalidate, private"
+    )
+    response.headers["Pragma"] = "no-cache"
+
+    return response
+
 @app.route("/dashboard")
 def dashboard():
     user_id = session.get("user_id")
@@ -807,8 +1064,19 @@ def dashboard():
         return redirect(url_for("captcha"))
 
     if security_layer < 3:
-        flash("Debes verificar el código enviado por correo.", "error")
+        flash(
+            "Debes verificar el código enviado por correo.",
+            "error",
+        )
         return redirect(url_for("email_verification"))
+
+    if security_layer < 4:
+        flash(
+            "Debes verificar el código de tu autenticador.",
+            "error",
+        )
+        return redirect(url_for("totp_verification"))
+
     database = get_db()
 
     user = database.execute(
